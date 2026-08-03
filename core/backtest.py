@@ -37,6 +37,11 @@ class BTResult:
     exits: dict[str, int] = field(default_factory=dict)
     # (close_time, r_multiple) per closed trade, in close order
     r_series: list[tuple[datetime, float]] = field(default_factory=list)
+    # The BAR window actually replayed — identical across candidates on the same
+    # feed, so the optimizer can cut IS/OOS on a shared clock rather than on each
+    # candidate's own first/last trade.
+    window_start: datetime | None = None
+    window_end: datetime | None = None
 
     @property
     def r_list(self) -> list[float]:
@@ -75,6 +80,10 @@ def run_quiet(
     cfg.set("ai.enabled", False)
     cfg.set("session.enabled", False)
     cfg.set("paper.speed", 1)
+    # Replay the NEWEST `bars` of history, not the oldest. Without this the
+    # window stays anchored at the start of the CSV and never sees recent data
+    # as the cache grows.
+    cfg.set("paper.csv_tail_bars", bars + 300)
     if params:
         merged = dict(cfg.get("strategy.params", {}) or {})
         merged.update(params)
@@ -92,6 +101,7 @@ def run_quiet(
     candle_count = int(cfg.get("engine.candles", 400))
 
     broker = PaperBroker(cfg)
+    broker.entry_at_open = True     # fill where a live order would actually land
     broker.connect()
     strategy = make_strategy(cfg)
     risk = RiskManager(cfg)
@@ -105,45 +115,58 @@ def run_quiet(
     settled = 0
 
     for _ in range(bars):
-        broker.pump()
+        # Event order mirrors live exactly:
+        #   1. a new bar opens (the previous bar has just closed)
+        #   2. the strategy acts on that just-closed bar and we fill at THIS
+        #      bar's open — which is where a live market order lands
+        #   3. only then is this bar's high/low applied to every position,
+        #      including the one just opened
+        broker.advance()
         if broker.data_exhausted():
             break
 
         account = broker.account()
         equity_curve.append(account.equity)
-        risk.roll_day(account, now=broker.tick(symbols[0]).time)
+        now = broker.tick(symbols[0]).time
+        risk.roll_day(account, now=now)
+        if result.window_start is None:
+            result.window_start = now
+        result.window_end = now
 
-        # Collect any fills settled by this pump before evaluating new entries.
         settled = _collect_closes(broker, risk_by_ticket, result, settled)
 
-        if risk.daily_limit_breached(account):
-            continue
+        if not risk.daily_limit_breached(account):
+            for symbol in symbols:
+                candles = broker.candles(symbol, timeframe, candle_count)
+                if len(candles) < 60 or last_bar.get(symbol) == candles[-2].time:
+                    continue
+                last_bar[symbol] = candles[-2].time
 
-        for symbol in symbols:
-            candles = broker.candles(symbol, timeframe, candle_count)
-            if len(candles) < 60 or last_bar.get(symbol) == candles[-2].time:
-                continue
-            last_bar[symbol] = candles[-2].time
+                info = broker.symbol_info(symbol)
+                sig = strategy.generate(symbol, timeframe, candles, info)
+                if sig is None:
+                    continue
+                result.signals += 1
 
-            info = broker.symbol_info(symbol)
-            sig = strategy.generate(symbol, timeframe, candles, info)
-            if sig is None:
-                continue
-            result.signals += 1
+                decision = risk.check(sig, account, info, broker.tick(symbol), broker.positions())
+                if not decision.ok:
+                    key = decision.reason.split(":")[0].split("(")[0].strip()
+                    result.blocked[key] = result.blocked.get(key, 0) + 1
+                    continue
 
-            decision = risk.check(sig, account, info, broker.tick(symbol), broker.positions())
-            if not decision.ok:
-                key = decision.reason.split(":")[0].split("(")[0].strip()
-                result.blocked[key] = result.blocked.get(key, 0) + 1
-                continue
+                order = broker.market_order(
+                    symbol, sig.side, decision.volume, sig.sl, sig.tp, "bt"
+                )
+                if order.ok:
+                    # Size from the ACTUAL fill, not the stale signal price, so
+                    # a stop-out really is -1R.
+                    fill_risk = abs(order.price - sig.sl) / info.tick_size * info.tick_value * order.volume
+                    risk_by_ticket[order.ticket] = fill_risk or decision.risk_amount
+                    risk.record_trade()
 
-            order = broker.market_order(symbol, sig.side, decision.volume, sig.sl, sig.tp, "bt")
-            if order.ok:
-                risk_by_ticket[order.ticket] = decision.risk_amount
-                risk.record_trade()
+        broker.settle()
 
     broker.close_all()
-    broker.pump()
     _collect_closes(broker, risk_by_ticket, result, settled)
 
     result.end_balance = round(broker.balance, 2)

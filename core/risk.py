@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
-from core.models import AccountInfo, Position, Signal, SymbolInfo, Tick
+from core.models import AccountInfo, Position, Side, Signal, SymbolInfo, Tick
 
 log = logging.getLogger("risk")
 
@@ -117,6 +117,19 @@ class RiskManager:
                 False,
                 reason=f"free margin {account.free_margin_pct:.1f}% below "
                 f"{self.min_free_margin_pct:.1f}% floor",
+            )
+
+        # Price may have moved past the stop between bar close and execution.
+        # Such a trade is nonsense — it would be stopped out on entry — and a
+        # broker would reject it anyway. Catch it here so the reason is logged.
+        fill = tick.price_for(signal.side)
+        if signal.side is Side.BUY and signal.sl >= fill:
+            return RiskDecision(
+                False, reason=f"price moved: SL {signal.sl} is at/above the {fill} ask"
+            )
+        if signal.side is Side.SELL and signal.sl <= fill:
+            return RiskDecision(
+                False, reason=f"price moved: SL {signal.sl} is at/below the {fill} bid"
             )
 
         sym_conf = self.cfg.symbol_conf(signal.symbol)

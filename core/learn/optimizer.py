@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import random
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 from core.backtest import BTResult, run_quiet
@@ -38,8 +39,17 @@ _INT_PARAMS = {"ema_fast", "ema_slow", "adx_min"}
 
 @dataclass
 class Split:
+    """Three windows, cut on a clock shared by every candidate.
+
+      is_r    train    — where params are free to fit
+      oos_r   select   — where challengers are RANKED and gated
+      hold_r  confirm  — never used for ranking; the winner must not fall apart
+                         here, which is what stops the winner's curse
+    """
+
     is_r: list[float] = field(default_factory=list)
     oos_r: list[float] = field(default_factory=list)
+    hold_r: list[float] = field(default_factory=list)
 
     @property
     def is_expectancy(self) -> float:
@@ -48,6 +58,10 @@ class Split:
     @property
     def oos_expectancy(self) -> float:
         return _mean(self.oos_r)
+
+    @property
+    def hold_expectancy(self) -> float:
+        return _mean(self.hold_r)
 
 
 @dataclass
@@ -122,72 +136,113 @@ def generate_candidates(
 
 # ---------------------------------------------------------------- evaluation
 def evaluate_candidate(
-    cfg: Config, params: dict[str, Any], source: str, bars: int, is_fraction: float
-) -> CandidateEval | None:
+    cfg: Config, params: dict[str, Any], source: str, bars: int
+) -> tuple[dict[str, Any], str, BTResult] | None:
+    """Backtest one candidate. Splitting happens later, on a shared clock."""
     try:
         result: BTResult = run_quiet(cfg, bars=bars, params=params)
     except Exception as exc:  # noqa: BLE001 - a broken candidate just drops out
         log.warning("candidate %s failed to evaluate: %s", params, exc)
         return None
-
-    split = split_by_time(result, is_fraction)
-    return CandidateEval(
-        params=params,
-        source=source,
-        split=split,
-        max_dd_pct=result.max_dd_pct,
-        trades=result.trades,
-    )
+    return params, source, result
 
 
-def split_by_time(result: BTResult, is_fraction: float) -> Split:
-    """Split closed trades into IS/OOS by the time axis, not by trade count.
+def shared_cutoffs(
+    results: list[BTResult], is_fraction: float, holdout_fraction: float
+) -> tuple[Any, Any] | None:
+    """(select_start, holdout_start) on the BAR window, shared by all candidates.
 
-    Splitting on trade count would let a candidate that trades rarely early on
-    push all its activity into 'OOS'. Cutting on the clock keeps every
-    candidate's OOS window identical.
+    Anchoring to each candidate's own first/last TRADE would give every
+    candidate a different calendar window — a stricter filter that starts
+    trading later would silently get a different, easier OOS period. Anchoring
+    to the replayed bar window (identical across candidates on one feed)
+    removes that.
     """
+    starts = [r.window_start for r in results if r.window_start is not None]
+    ends = [r.window_end for r in results if r.window_end is not None]
+    if not starts or not ends:
+        return None
+    t0, t1 = min(starts), max(ends)
+    span = (t1 - t0).total_seconds()
+    if span <= 0:
+        return None
+    select_frac = max(0.0, min(1.0, is_fraction))
+    hold_frac = max(0.0, min(1.0 - select_frac, holdout_fraction))
+    select_start = t0 + timedelta(seconds=span * select_frac)
+    holdout_start = t0 + timedelta(seconds=span * (1.0 - hold_frac))
+    return select_start, holdout_start
+
+
+def split_by_time(
+    result: BTResult, is_fraction: float, cutoffs: tuple[Any, Any] | None = None
+) -> Split:
+    """Cut a candidate's trades into train / select / holdout on a shared clock."""
     split = Split()
     if not result.r_series:
         return split
-    times = [t for t, _ in result.r_series]
-    t0, t1 = min(times), max(times)
-    span = (t1 - t0).total_seconds()
-    if span <= 0:
-        split.is_r = [r for _, r in result.r_series]
-        return split
-    cutoff_seconds = span * is_fraction
+
+    if cutoffs is None:  # standalone use (no cross-candidate comparison)
+        times = [t for t, _ in result.r_series]
+        t0, t1 = min(times), max(times)
+        span = (t1 - t0).total_seconds()
+        if span <= 0:
+            split.is_r = [r for _, r in result.r_series]
+            return split
+        select_start = t0 + timedelta(seconds=span * is_fraction)
+        holdout_start = t1 + timedelta(seconds=1)   # no holdout
+    else:
+        select_start, holdout_start = cutoffs
+
     for when, r in result.r_series:
-        if (when - t0).total_seconds() <= cutoff_seconds:
+        if when < select_start:
             split.is_r.append(r)
-        else:
+        elif when < holdout_start:
             split.oos_r.append(r)
+        else:
+            split.hold_r.append(r)
     return split
 
 
 # ---------------------------------------------------------------- promotion
+def required_bootstrap_prob(base: float, n_challengers: int, correct: bool) -> float:
+    """Bonferroni-style tightening for testing many challengers at once.
+
+    Ranking ~15 candidates on one window and promoting the best is a multiple-
+    comparisons problem: with enough draws, noise clears any fixed bar. A
+    bootstrap probability `p` corresponds to a one-sided error of (1-p); to hold
+    the FAMILY-wise error at (1-base) across K challengers, each must clear
+    1 - (1-base)/K.
+    """
+    if not correct or n_challengers <= 1:
+        return base
+    return min(0.999, 1.0 - (1.0 - base) / n_challengers)
+
+
 def passes_promotion(
     candidate: CandidateEval,
     incumbent: CandidateEval,
     cfg,
     rng: random.Random,
+    n_challengers: int = 1,
 ) -> tuple[bool, str]:
     """The full gauntlet. Returns (promote?, human-readable reason)."""
     min_oos = int(cfg.get("learning.optimizer.min_oos_trades", 20))
+    min_hold = int(cfg.get("learning.optimizer.min_holdout_trades", 10))
     margin = float(cfg.get("learning.optimizer.margin_r", 0.03))
-    need_prob = float(cfg.get("learning.optimizer.bootstrap_prob", 0.75))
+    base_prob = float(cfg.get("learning.optimizer.bootstrap_prob", 0.75))
+    correct = bool(cfg.get("learning.optimizer.multiplicity_correction", True))
     max_dd_ratio = float(cfg.get("learning.optimizer.max_dd_ratio", 1.3))
 
     c, i = candidate.split, incumbent.split
 
     if len(c.oos_r) < min_oos:
-        return False, f"only {len(c.oos_r)}/{min_oos} OOS trades"
+        return False, f"only {len(c.oos_r)}/{min_oos} selection-window trades"
     if len(i.oos_r) < min_oos:
-        return False, f"incumbent has only {len(i.oos_r)} OOS trades — window too thin to compare"
+        return False, f"incumbent has only {len(i.oos_r)} selection trades — too thin to compare"
 
     edge = c.oos_expectancy - i.oos_expectancy
     if edge < margin:
-        return False, f"OOS edge {edge:+.3f}R below margin {margin}R"
+        return False, f"selection edge {edge:+.3f}R below margin {margin}R"
 
     # Regime-fit guard: a candidate that only wins in the newest window is
     # suspicious. It must not be materially worse than the incumbent in-sample.
@@ -203,13 +258,33 @@ def passes_promotion(
             f"{incumbent.max_dd_pct:.1f}% exceeds ratio {max_dd_ratio}"
         )
 
-    prob = bootstrap_prob(c.oos_r, i.oos_r, rng=rng)
+    need_prob = required_bootstrap_prob(base_prob, n_challengers, correct)
+    prob = bootstrap_prob(c.oos_r, i.oos_r, n=2000, rng=rng)
     if prob < need_prob:
-        return False, f"bootstrap P(candidate>incumbent)={prob:.2f} < {need_prob}"
+        return False, (
+            f"bootstrap P(candidate>incumbent)={prob:.3f} < {need_prob:.3f} "
+            f"(family-wise over {n_challengers} challengers)"
+        )
+
+    # Holdout confirmation — the winner was RANKED on the selection window, so
+    # that window is contaminated by selection. The holdout was never ranked on;
+    # the winner must simply not be worse than the incumbent there.
+    if min_hold > 0:
+        if len(c.hold_r) < min_hold or len(i.hold_r) < min_hold:
+            return False, (
+                f"holdout too thin ({len(c.hold_r)} vs incumbent {len(i.hold_r)}, "
+                f"need {min_hold}) — cannot confirm the selection"
+            )
+        if c.hold_expectancy < i.hold_expectancy:
+            return False, (
+                f"failed holdout confirmation: {c.hold_expectancy:+.3f}R vs "
+                f"incumbent {i.hold_expectancy:+.3f}R on data it was not selected on"
+            )
 
     return True, (
-        f"OOS {c.oos_expectancy:+.3f}R vs {i.oos_expectancy:+.3f}R "
-        f"({len(c.oos_r)} trades), bootstrap {prob:.2f}"
+        f"selection {c.oos_expectancy:+.3f}R vs {i.oos_expectancy:+.3f}R "
+        f"({len(c.oos_r)} trades), bootstrap {prob:.3f} >= {need_prob:.3f}, "
+        f"holdout {c.hold_expectancy:+.3f}R vs {i.hold_expectancy:+.3f}R"
     )
 
 
@@ -259,17 +334,32 @@ def run_optimizer(
         return OptimizerOutcome(skipped_reason="no learning.optimizer.bounds configured")
 
     bars = int(cfg.get("learning.optimizer.bars", 20000))
-    is_fraction = float(cfg.get("learning.optimizer.is_fraction", 0.7))
+    is_fraction = float(cfg.get("learning.optimizer.is_fraction", 0.6))
+    holdout_fraction = float(cfg.get("learning.optimizer.holdout_fraction", 0.15))
     n_random = int(cfg.get("learning.optimizer.n_random", 12))
     rng = random.Random(seed)
 
     candidates = generate_candidates(incumbent_params, bounds, analyst_proposals, rng, n_random)
 
-    evals: list[CandidateEval] = []
+    raw: list[tuple[dict[str, Any], str, BTResult]] = []
     for params, source in candidates:
-        ev = evaluate_candidate(cfg, params, source, bars, is_fraction)
+        ev = evaluate_candidate(cfg, params, source, bars)
         if ev is not None:
-            evals.append(ev)
+            raw.append(ev)
+
+    if not raw:
+        return OptimizerOutcome(skipped_reason="no candidate evaluated successfully")
+
+    # ONE clock for every candidate — see shared_cutoffs().
+    cutoffs = shared_cutoffs([r for _, _, r in raw], is_fraction, holdout_fraction)
+    evals = [
+        CandidateEval(
+            params=params, source=source,
+            split=split_by_time(result, is_fraction, cutoffs),
+            max_dd_pct=result.max_dd_pct, trades=result.trades,
+        )
+        for params, source, result in raw
+    ]
 
     incumbent_eval = next((e for e in evals if e.source == "incumbent"), None)
     if incumbent_eval is None:
@@ -281,23 +371,34 @@ def run_optimizer(
         incumbent_oos_expectancy=incumbent_eval.split.oos_expectancy,
     )
 
-    # Rank challengers by OOS expectancy; the first to pass the gauntlet wins.
+    # Rank challengers on the SELECTION window; the winner still has to survive
+    # the multiplicity-corrected bootstrap and the untouched holdout.
     challengers = sorted(
         (e for e in evals if e.source != "incumbent"),
         key=lambda e: e.split.oos_expectancy,
         reverse=True,
     )
+    n_challengers = len(challengers)
     for challenger in challengers:
-        ok, reason = passes_promotion(challenger, incumbent_eval, cfg, rng)
+        ok, reason = passes_promotion(challenger, incumbent_eval, cfg, rng, n_challengers)
         if ok:
             outcome.promoted = challenger.params
             outcome.promoted_source = challenger.source
-            outcome.promoted_oos_expectancy = challenger.split.oos_expectancy
+            # Report the HOLDOUT expectancy as the promise the live rollback
+            # guard is measured against. The selection-window number is
+            # upward-biased by having been the max of many draws.
+            outcome.promoted_oos_expectancy = min(
+                challenger.split.oos_expectancy, challenger.split.hold_expectancy
+            )
             outcome.evidence = reason
             log.info("promoting %s candidate: %s", challenger.source, reason)
             return outcome
 
-    outcome.evidence = "no challenger beat the incumbent out-of-sample"
+    best = challengers[0].split.oos_expectancy if challengers else 0.0
+    outcome.evidence = (
+        f"no challenger cleared the gauntlet (best selection {best:+.3f}R vs "
+        f"incumbent {incumbent_eval.split.oos_expectancy:+.3f}R)"
+    )
     return outcome
 
 

@@ -53,6 +53,8 @@ class LearningReport:
     lessons_added_preview: list[str] = field(default_factory=list)
     analyst_summary: str = ""
     optimizer: opt.OptimizerOutcome | None = None
+    optimizer_ran: bool = False
+    history_bars: int = 0
     rollback: bool = False
     rollback_reason: str = ""
     stats_line: str = ""
@@ -91,6 +93,11 @@ class LearningSystem:
     @property
     def min_confidence(self) -> float:
         return float(self._gate_state.get("min_confidence", 0.55))
+
+    def stamp_optimizer_run(self, bars: int) -> None:
+        """Record the data volume the optimizer last ran on (main thread)."""
+        self._sched_state["optimizer_bars"] = int(bars)
+        self._save_json("learning_state.json", self._sched_state)
 
     def save_gate_state(self, mode: str, min_confidence: float, reason: str) -> None:
         self._gate_state = {
@@ -278,10 +285,44 @@ class LearningSystem:
                 return report  # revert first; optimize again next week
 
         # 4. Optimizer -------------------------------------------------------
+        # Gate on genuinely new data. Re-drawing fresh random candidates every
+        # week against an essentially unchanged window is repeated sampling
+        # until noise clears the bar — the exact failure this system exists to
+        # avoid. `bars_seen` is reported back and stamped on the main thread.
+        min_new = int(self.cfg.get("learning.optimizer.min_new_bars", 400))
+        bars_now = self._count_history_bars()
+        bars_at_last_run = int(self._sched_state.get("optimizer_bars", 0))
+        report.history_bars = bars_now
+
+        if min_new > 0 and bars_now - bars_at_last_run < min_new:
+            report.optimizer = opt.OptimizerOutcome(
+                skipped_reason=(
+                    f"only {bars_now - bars_at_last_run} new bars since the last "
+                    f"optimizer run (need {min_new}) — nothing new to learn from"
+                )
+            )
+            return report
+
         report.optimizer = opt.run_optimizer(
             self.cfg, current_params, result.param_proposals, seed
         )
+        report.optimizer_ran = True
         return report
+
+    def _count_history_bars(self) -> int:
+        """Total cached CSV bars across symbols — the optimizer's data volume."""
+        timeframe = str(self.cfg.get("engine.timeframe", "M15")).upper()
+        total = 0
+        for sym in self.cfg.enabled_symbols():
+            path = self.data_dir / f"{sym['name']}_{timeframe}.csv"
+            if not path.exists():
+                continue
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    total += max(0, sum(1 for _ in fh) - 1)
+            except OSError:
+                continue
+        return total
 
     @staticmethod
     def _live_r_since(journal: Journal, since_iso: str) -> list[float]:

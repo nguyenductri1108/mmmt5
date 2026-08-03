@@ -610,6 +610,8 @@ class Engine:
         # 4. Promotion ---------------------------------------------------------
         elif report.optimizer is not None:
             outcome = report.optimizer
+            if report.optimizer_ran:
+                self.learning.stamp_optimizer_run(report.history_bars)
             if outcome.promoted:
                 previous = dict(self.cfg.get("strategy.params", {}) or {})
                 self.learning.promote_params(

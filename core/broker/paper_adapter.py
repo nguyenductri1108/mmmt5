@@ -58,6 +58,12 @@ class PaperBroker(Broker):
         self.slippage_points = float(cfg.get("paper.slippage_points", 3))
         self.feed = str(cfg.get("paper.feed", "synthetic")).lower()
         self.speed = max(1, int(cfg.get("paper.speed", 1)))
+        # Keep only the newest N bars of a CSV. Without this the optimizer would
+        # replay the OLDEST window forever as the cached history grows.
+        self.csv_tail = int(cfg.get("paper.csv_tail_bars", 0))
+        # Backtest mode: fill at the current bar's OPEN instead of its close,
+        # which is where a live order placed on the previous bar's close lands.
+        self.entry_at_open = False
 
         self._rng = random.Random(int(cfg.get("paper.synthetic_seed", 42)))
         self._tickets = _counter(1000001)
@@ -152,14 +158,26 @@ class PaperBroker(Broker):
                     )
                 )
         rows.sort(key=lambda c: c.time)
+        # Duplicate timestamps (re-cached bars) would double-count; keep the last.
+        deduped: dict[datetime, Candle] = {}
+        for candle in rows:
+            deduped[candle.time] = candle
+        rows = [deduped[key] for key in sorted(deduped)]
+
         if len(rows) < 250:
             raise ValueError(f"{path} has only {len(rows)} bars — need at least 250 for warmup.")
 
-        self._csv_all[symbol] = rows
         warmup = 250
+        if self.csv_tail > 0 and len(rows) > self.csv_tail:
+            rows = rows[-self.csv_tail:]
+
+        self._csv_all[symbol] = rows
         self._series[symbol] = rows[:warmup]
         self._csv_cursor[symbol] = warmup
-        log.info("Loaded %d bars for %s from %s", len(rows), symbol, path.name)
+        log.info(
+            "Loaded %d bars for %s from %s (%s .. %s)",
+            len(rows), symbol, path.name, rows[0].time, rows[-1].time,
+        )
 
     def pump(self) -> None:
         """Advance simulated time by `speed` bars and settle any SL/TP hits."""
@@ -169,6 +187,22 @@ class PaperBroker(Broker):
                 if bar is None:
                     continue
                 self._settle_bar(symbol, bar)
+
+    # --- split form, used by the backtester so the event order matches live ---
+    def advance(self) -> None:
+        """Append one bar per symbol WITHOUT settling positions."""
+        for symbol, series in self._series.items():
+            self._advance_one(symbol, series)
+
+    def settle(self) -> None:
+        """Range-test every open position against each symbol's newest bar.
+
+        Called AFTER order placement, so a position opened on this bar is
+        exposed to this bar's high/low — exactly like live.
+        """
+        for symbol, series in self._series.items():
+            if series:
+                self._settle_bar(symbol, series[-1])
 
     def _advance_one(self, symbol: str, series: list[Candle]) -> Candle | None:
         if self.feed == "csv":
@@ -217,7 +251,10 @@ class PaperBroker(Broker):
         if not series:
             raise RuntimeError(f"no simulated series for {symbol}")
         info = self.symbol_info(symbol)
-        mid = series[-1].close
+        # In backtest mode the decision was made on the PREVIOUS bar's close, so
+        # the realistic fill is this bar's open — not its close, which would give
+        # the strategy a full bar of hindsight it never has live.
+        mid = series[-1].open if self.entry_at_open else series[-1].close
         half = self.spread_points * info.point / 2.0
         return Tick(
             symbol=symbol,
@@ -270,6 +307,16 @@ class PaperBroker(Broker):
         tick = self.tick(symbol)
         slip = self.slippage_points * info.point * side.sign
         price = info.normalize_price(tick.price_for(side) + slip)
+
+        # A real broker rejects a stop on the wrong side of the fill. Without
+        # this the simulator would open a position already past its own stop and
+        # then "settle" it at the stop price for a POSITIVE P&L — booking a
+        # stop-out as a win and poisoning every statistic built on it.
+        if sl:
+            if side is Side.BUY and sl >= price:
+                return OrderResult(ok=False, error=f"SL {sl} is at/above BUY fill {price}")
+            if side is Side.SELL and sl <= price:
+                return OrderResult(ok=False, error=f"SL {sl} is at/below SELL fill {price}")
 
         ticket = next(self._tickets)
         self._positions[ticket] = Position(
@@ -332,9 +379,16 @@ class PaperBroker(Broker):
             hit_tp = (pos.side is Side.BUY and bar.high >= pos.tp) or (
                 pos.side is Side.SELL and bar.low <= pos.tp
             )
-            # Pessimistic: if both are inside one bar, assume the stop went first.
+            # Pessimistic on both counts:
+            #  * if SL and TP are both inside one bar, assume the stop went first
+            #  * a gap through the stop fills at the gapped price, not at the
+            #    stop level — you do not get your stop price in a gap
             if hit_sl:
-                self._settle(ticket, pos.sl, "sl")
+                if pos.side is Side.BUY:
+                    fill = min(pos.sl, bar.open) if bar.open < pos.sl else pos.sl
+                else:
+                    fill = max(pos.sl, bar.open) if bar.open > pos.sl else pos.sl
+                self._settle(ticket, fill, "sl")
             elif hit_tp:
                 self._settle(ticket, pos.tp, "tp")
 

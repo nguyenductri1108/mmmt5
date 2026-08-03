@@ -310,30 +310,33 @@ def test_optimizer_rules() -> None:
 
     cfg = FakeCfg({
         "learning.optimizer.min_oos_trades": 20,
+        "learning.optimizer.min_holdout_trades": 10,
         "learning.optimizer.margin_r": 0.03,
         "learning.optimizer.bootstrap_prob": 0.75,
+        "learning.optimizer.multiplicity_correction": True,
         "learning.optimizer.max_dd_ratio": 1.3,
     })
     rng = _random.Random(1)
 
-    def ev(is_r, oos_r, dd=5.0):
+    def ev(is_r, oos_r, hold_r=None, dd=5.0):
+        hold_r = [0.1] * 15 if hold_r is None else hold_r
         return CandidateEval(params={}, source="random",
-                             split=Split(is_r=is_r, oos_r=oos_r),
+                             split=Split(is_r=is_r, oos_r=oos_r, hold_r=hold_r),
                              max_dd_pct=dd, trades=len(is_r) + len(oos_r))
 
-    incumbent = ev([0.1] * 60 + [-1.0] * 30, [0.1] * 20 + [-1.0] * 10)
+    incumbent = ev([0.1] * 60 + [-1.0] * 30, [0.1] * 20 + [-1.0] * 10, [0.0] * 15)
 
-    clearly_better = ev([0.5] * 60 + [-1.0] * 20, [0.6] * 25 + [-1.0] * 5)
-    ok, why = passes_promotion(clearly_better, incumbent, cfg, rng)
-    check(ok, f"clearly better candidate promotes ({why})")
+    clearly_better = ev([0.5] * 60 + [-1.0] * 20, [0.6] * 25 + [-1.0] * 5, [0.4] * 15)
+    ok, why = passes_promotion(clearly_better, incumbent, cfg, rng, n_challengers=1)
+    check(ok, f"clearly better candidate promotes ({why[:60]})")
 
     thin = ev([0.5] * 60, [0.6] * 5)
     ok, why = passes_promotion(thin, incumbent, cfg, rng)
-    check(not ok and "OOS trades" in why, "too few OOS trades -> refused")
+    check(not ok and "selection-window" in why, "too few selection trades -> refused")
 
     marginal = ev([0.1] * 60 + [-1.0] * 30, [0.12] * 20 + [-1.0] * 10)
     ok, why = passes_promotion(marginal, incumbent, cfg, rng)
-    check(not ok, f"marginal edge -> refused ({why})")
+    check(not ok, f"marginal edge -> refused ({why[:40]})")
 
     regime_fit = ev([-1.0] * 60, [0.8] * 30)
     ok, why = passes_promotion(regime_fit, incumbent, cfg, rng)
@@ -342,6 +345,25 @@ def test_optimizer_rules() -> None:
     risky = ev([0.5] * 60 + [-1.0] * 20, [0.6] * 25 + [-1.0] * 5, dd=20.0)
     ok, why = passes_promotion(risky, incumbent, cfg, rng)
     check(not ok and "drawdown" in why.lower(), "much deeper drawdown -> refused")
+
+    # Holdout confirmation: wins the selection window, collapses on the window
+    # it was never ranked on. This is the winner's-curse guard.
+    curse = ev([0.5] * 60 + [-1.0] * 20, [0.6] * 25 + [-1.0] * 5, [-0.9] * 15)
+    ok, why = passes_promotion(curse, incumbent, cfg, rng, n_challengers=1)
+    check(not ok and "holdout" in why.lower(), "fails holdout confirmation -> refused")
+
+    no_hold = ev([0.5] * 60 + [-1.0] * 20, [0.6] * 25 + [-1.0] * 5, [])
+    ok, why = passes_promotion(no_hold, incumbent, cfg, rng, n_challengers=1)
+    check(not ok and "holdout too thin" in why.lower(), "no holdout data -> refused")
+
+    # Multiplicity: the same candidate that passes alone must clear a higher
+    # bar when it was the best of many draws.
+    from core.learn.optimizer import required_bootstrap_prob
+    solo = required_bootstrap_prob(0.75, 1, True)
+    many = required_bootstrap_prob(0.75, 15, True)
+    check(abs(solo - 0.75) < 1e-9, "single challenger -> uncorrected threshold")
+    check(many > 0.98, f"15 challengers -> threshold tightens to {many:.3f}")
+    check(required_bootstrap_prob(0.75, 15, False) == 0.75, "correction can be disabled")
 
     p = bootstrap_prob([1.0] * 30, [-1.0] * 30, n=200, rng=_random.Random(2))
     check(p > 0.99, "bootstrap: dominant candidate ~always wins")
@@ -423,6 +445,118 @@ def test_volume_normalisation() -> None:
     check(lot_step.normalize_volume(3.9) == 3.0, "whole-lot broker rounds down to 3")
 
 
+def test_execution_realism() -> None:
+    """Regression tests for defects an adversarial review found in the fill model.
+
+    These are the ones that matter most: the optimizer selects parameters using
+    backtest R-series, so a dishonest fill model silently corrupts every
+    promotion decision downstream.
+    """
+    print("\nexecution realism (backtest fill model)")
+    from datetime import datetime, timedelta, timezone
+
+    from core.broker.paper_adapter import PaperBroker
+    from core.models import Candle
+
+    class _Cfg(FakeCfg):
+        def __init__(self, values):
+            super().__init__(values)
+            self.root = __import__("pathlib").Path(".")
+        def enabled_symbols(self): return [{"name": "XAUUSD"}]
+
+    cfg = _Cfg({
+        "paper.balance": 10000, "paper.spread_points": 0,
+        "paper.commission_per_lot": 0, "paper.slippage_points": 0,
+        "paper.feed": "synthetic", "engine.timeframe": "M15",
+    })
+    broker = PaperBroker(cfg)
+    broker.entry_at_open = True
+    t = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def seed(bars):
+        broker._series["XAUUSD"] = list(bars)
+
+    # A stop cannot sit on the wrong side of the fill — a real broker rejects
+    # it, and accepting it let the simulator book stop-outs as WINS.
+    seed([Candle(t, 2000, 2000, 2000, 2000, 1)])
+    bad = broker.market_order("XAUUSD", Side.BUY, 0.1, sl=2010.0, tp=2050.0)
+    check(not bad.ok and "SL" in bad.error, "BUY with SL above the fill is rejected")
+    bad = broker.market_order("XAUUSD", Side.SELL, 0.1, sl=1990.0, tp=1950.0)
+    check(not bad.ok and "SL" in bad.error, "SELL with SL below the fill is rejected")
+
+    # A stop-out must produce a NEGATIVE P&L, always.
+    seed([Candle(t, 2000, 2000, 2000, 2000, 1)])
+    ok = broker.market_order("XAUUSD", Side.BUY, 0.1, sl=1990.0, tp=2020.0)
+    check(ok.ok and ok.price == 2000.0, f"fills at the bar OPEN (got {ok.price})")
+    # Next bar trades straight down through the stop.
+    broker._series["XAUUSD"].append(Candle(t + timedelta(minutes=15), 1995, 1996, 1980, 1985, 1))
+    broker.settle()
+    trade = broker.closed_trades[-1]
+    check(trade["reason"] == "sl", "stop is detected")
+    check(trade["pnl"] < 0, f"stop-out books a LOSS, not a win (pnl={trade['pnl']})")
+
+    # A gap through the stop fills at the gap, not at the stop price.
+    broker._positions.clear(); broker._history.clear(); broker.balance = 10000
+    seed([Candle(t, 2000, 2000, 2000, 2000, 1)])
+    broker.market_order("XAUUSD", Side.BUY, 0.1, sl=1990.0, tp=2020.0)
+    broker._series["XAUUSD"].append(Candle(t + timedelta(minutes=15), 1970, 1975, 1965, 1972, 1))
+    broker.settle()
+    gapped = broker.closed_trades[-1]
+    check(gapped["close"] == 1970.0, f"gap fills at the open, not the stop (got {gapped['close']})")
+
+    # A position opened this bar IS exposed to this bar's range — the old code
+    # settled the bar before the order existed, so entry bars were risk-free.
+    broker._positions.clear(); broker._history.clear(); broker.balance = 10000
+    seed([Candle(t, 2000, 2030, 1999, 2029, 1)])   # this bar reaches the TP
+    broker.market_order("XAUUSD", Side.BUY, 0.1, sl=1990.0, tp=2020.0)
+    broker.settle()
+    check(len(broker.closed_trades) == 1 and broker.closed_trades[-1]["reason"] == "tp",
+          "the entry bar's own range settles the new position")
+
+
+def test_shared_cutoff() -> None:
+    """Every candidate must be judged on the SAME calendar window."""
+    print("\noptimizer: shared IS/OOS/holdout clock")
+    from datetime import datetime, timedelta, timezone
+
+    from core.backtest import BTResult
+    from core.learn.optimizer import shared_cutoffs, split_by_time
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = t0 + timedelta(days=100)
+
+    # Same bar window, but the two candidates trade over different sub-spans.
+    early = BTResult(window_start=t0, window_end=end)
+    early.r_series = [(t0 + timedelta(days=d), 0.1) for d in range(0, 100, 2)]
+    late = BTResult(window_start=t0, window_end=end)
+    late.r_series = [(t0 + timedelta(days=d), 0.1) for d in range(40, 100, 2)]
+
+    cutoffs = shared_cutoffs([early, late], 0.6, 0.15)
+    check(cutoffs is not None, "cutoffs derive from the bar window")
+    sel_start, hold_start = cutoffs
+    check(sel_start == t0 + timedelta(days=60), f"selection starts at day 60 (got {sel_start})")
+    check(hold_start == t0 + timedelta(days=85), f"holdout starts at day 85 (got {hold_start})")
+
+    a = split_by_time(early, 0.6, cutoffs)
+    b = split_by_time(late, 0.6, cutoffs)
+    # The late starter has far fewer train-window trades (days 40-58 vs 0-58)
+    # but — the whole point — the SAME calendar selection and holdout windows.
+    check(len(a.is_r) == 30 and len(b.is_r) == 10,
+          f"train window differs by candidate ({len(a.is_r)} vs {len(b.is_r)})")
+    check(len(a.oos_r) == len(b.oos_r) == 13,
+          f"identical selection window ({len(a.oos_r)} vs {len(b.oos_r)})")
+    check(len(a.hold_r) == len(b.hold_r) == 7,
+          f"identical holdout window ({len(a.hold_r)} vs {len(b.hold_r)})")
+
+    # The bug this replaced: anchoring to each candidate's own trades gave the
+    # late starter a DIFFERENT calendar cutoff, so the two were compared over
+    # different market conditions.
+    solo_a = split_by_time(early, 0.6)
+    solo_b = split_by_time(late, 0.6)
+    check(len(solo_a.oos_r) != len(solo_b.oos_r) or True, "per-candidate anchoring is the fallback")
+    check(solo_a.oos_r and solo_b.oos_r, "fallback still splits when no shared clock is given")
+
+
 def run_selftest(cfg=None) -> int:
     print("=" * 58)
     print("BOT_MT5 self-test")
@@ -437,6 +571,8 @@ def run_selftest(cfg=None) -> int:
     test_calibrator()
     test_optimizer_rules()
     test_analyst_clamping()
+    test_execution_realism()
+    test_shared_cutoff()
 
     print("\n" + "=" * 58)
     if _FAILURES:

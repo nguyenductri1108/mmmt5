@@ -159,13 +159,24 @@ learning:
   #    win-probability. Never runs on the synthetic feed.
   optimizer:
     enabled: true
-    bars: 20000
+    bars: 20000                # newest N bars of cached history are replayed
     n_random: 12
-    is_fraction: 0.7           # older 70% in-sample, newest 30% out-of-sample
-    min_oos_trades: 20
-    margin_r: 0.03             # OOS expectancy must beat incumbent by this (in R)
-    bootstrap_prob: 0.75       # P(candidate > incumbent) over 1000 resamples
+    # Three windows on ONE shared clock (identical for every candidate):
+    #   train 60% | selection 25% | holdout 15%
+    # Challengers are ranked on selection; the winner must then hold up on the
+    # holdout, which nothing was ranked on. That is what stops the winner's curse.
+    is_fraction: 0.6
+    holdout_fraction: 0.15
+    min_oos_trades: 20         # selection-window trades needed to compare
+    min_holdout_trades: 10     # holdout trades needed to confirm (0 disables)
+    margin_r: 0.03             # selection expectancy must beat incumbent by this (R)
+    bootstrap_prob: 0.75       # target FAMILY-wise confidence, not per-candidate
+    multiplicity_correction: true   # tighten the bar by the number of challengers
     max_dd_ratio: 1.3          # candidate max DD may not exceed incumbent's by more
+    # Do not re-roll candidates against a window that has barely moved — that is
+    # just repeated sampling until noise wins. Requires this many NEW bars since
+    # the last optimizer run.
+    min_new_bars: 400
     bounds:                    # the ONLY parameters the system may ever change
       ema_fast: [10, 30]
       ema_slow: [35, 80]
