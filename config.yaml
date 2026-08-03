@@ -1,0 +1,190 @@
+# ===========================================================================
+#  BOT_MT5 configuration
+#  Secrets live in .env — never put tokens or passwords in this file.
+# ===========================================================================
+
+mode: paper            # paper | live   (CLI --mode overrides this)
+
+engine:
+  loop_seconds: 5      # how often the main loop ticks
+  timeframe: M15       # M1 M5 M15 M30 H1 H4 D1
+  candles: 400         # history bars pulled per evaluation
+  magic: 570123        # MT5 magic number that tags this bot's orders
+
+# --- Instruments -----------------------------------------------------------
+# Suffix note: many brokers append a suffix (XAUUSD.m, EURUSD_raw, ...).
+# Use the EXACT name shown in MT5 Market Watch.
+symbols:
+  - name: XAUUSD
+    enabled: true
+    max_spread_points: 40      # skip signals when spread is wider than this
+    risk_pct: 0.5              # % of equity risked per trade on this symbol
+  - name: EURUSD
+    enabled: true
+    max_spread_points: 20
+    risk_pct: 0.5
+
+# --- Session filter (UTC, 24h clock) ---------------------------------------
+session:
+  enabled: true
+  weekdays: [0, 1, 2, 3, 4]    # Mon=0 ... Sun=6
+  windows:
+    - ["07:00", "11:00"]       # London
+    - ["12:30", "16:30"]       # NY overlap
+  # Hard stop-out: flatten everything and stop trading at this UTC time on Fri
+  friday_flat_at: "20:00"
+
+# --- Strategy --------------------------------------------------------------
+strategy:
+  name: ema_atr
+  params:
+    ema_fast: 20
+    ema_slow: 50
+    ema_trend: 200
+    atr_period: 14
+    adx_period: 14
+    adx_min: 18              # skip chop below this
+    pullback_atr: 0.8        # entry must be within N*ATR of the fast EMA
+    sl_atr_mult: 1.5
+    tp_r_multiple: 2.0       # TP distance = R * this
+    min_atr_points: 5        # skip dead markets
+
+# --- Risk ------------------------------------------------------------------
+risk:
+  default_risk_pct: 0.5      # used when a symbol has no risk_pct
+  max_open_positions: 3
+  max_positions_per_symbol: 1
+  daily_max_loss_pct: 3.0    # realised+floating loss vs day-start equity -> halt
+  daily_max_trades: 8
+  max_lot: 1.0               # hard ceiling regardless of what sizing computes
+  min_free_margin_pct: 30.0  # refuse new trades below this
+
+# --- Open-position management ---------------------------------------------
+manage:
+  enabled: true
+  breakeven_at_r: 1.0        # move SL to entry once trade is +1R (0 = off)
+  breakeven_offset_points: 5
+  trail_atr_mult: 0.0        # 0 = no ATR trailing; e.g. 2.0 to enable
+
+# --- AI gate ---------------------------------------------------------------
+ai:
+  enabled: true
+  primary: claude            # claude | openai
+  fallback: openai           # claude | openai | none
+  timeout_seconds: 20
+  on_error: reject           # reject (safe) | approve (keep trading if AI is down)
+  min_confidence: 0.55       # verdicts below this are treated as reject
+  allow_size_reduction: true # honour the model's size_multiplier
+  # Shadow mode: ask the AI, log the verdict, but execute the trade regardless.
+  # NOTE: when learning.enabled is true this flag is IGNORED — the calibrator
+  # manages shadow/enforce automatically from measured outcomes (starts in
+  # shadow, enforces once rejections are proven to dodge losers). This flag
+  # only applies when the learning system is switched off.
+  shadow_mode: false
+  claude:
+    model: claude-opus-5     # cheaper alternative: claude-haiku-4-5
+    effort: low              # low | medium | high | xhigh | max
+    max_tokens: 4000         # must cover thinking + the JSON verdict
+  openai:
+    # Set this to a model your account actually has access to.
+    model: gpt-5
+    max_tokens: 4000
+
+# --- Telegram --------------------------------------------------------------
+telegram:
+  enabled: true
+  notify_signals: true       # message on every signal, even rejected ones
+  notify_rejects: true
+  notify_fills: true
+  notify_closes: true
+  heartbeat_minutes: 60      # 0 = off
+  commands_enabled: true     # /pause /resume /status /positions /close /flat
+
+# --- Paper (simulated) broker — used when mode=paper ----------------------
+paper:
+  balance: 10000
+  leverage: 500
+  spread_points: 15
+  commission_per_lot: 7.0
+  slippage_points: 3
+  # Price source: "synthetic" (random walk) or "csv"
+  feed: synthetic
+  csv_dir: data            # expects <csv_dir>/<SYMBOL>_<TF>.csv (time,open,high,low,close,volume)
+  synthetic_seed: 42
+  speed: 60                # synthetic bars generated per loop tick (fast-forward)
+
+# --- Self-improvement loop --------------------------------------------------
+# Fully automatic. The one hard rule: nothing in here can raise risk caps —
+# risk.* and session.* are never auto-touched, and every learned multiplier
+# can only SHRINK a position, never grow it.
+learning:
+  enabled: true
+
+  # 1) Episodic memory: k-NN over your own closed trades. Similar past setups
+  #    are shown to the AI gate and produce a bounded size prior.
+  evidence:
+    enabled: true
+    k: 25                  # neighbours consulted
+    min_neighbors: 10      # below this -> no effect (multiplier 1.0)
+    shrink_m: 15           # pseudo-observations pulled toward the global mean
+    floor: 0.5             # worst-case size multiplier from bad evidence
+
+  # 2) Gate calibration: measures whether AI rejections actually dodge losers.
+  #    Starts in shadow (trade everything, record verdicts). Auto-enforces once
+  #    rejections are proven to lose money; auto-reverts to shadow if they
+  #    start blocking winners. While enforcing, a random slice of rejected
+  #    signals is still traded ("audit") so the counterfactual stays measurable.
+  gate:
+    audit_fraction: 0.2
+    min_measured_rejects: 15   # evidence needed before switching modes
+    enforce_below_r: -0.05     # rejected-bucket avg R worse than this -> enforce
+    shadow_above_r: 0.05       # rejected-bucket avg R better than this -> back to shadow
+    confidence_grid: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+    confidence_min_sample: 30
+
+  # 3) Weekly AI analyst: reads the journal, maintains a small set of
+  #    evidence-cited "lessons" injected into the gate prompt, and proposes
+  #    parameter candidates for the optimizer. Skipped cleanly if no AI key.
+  analyst:
+    enabled: true
+    model: claude-opus-5
+    effort: xhigh
+    max_lessons: 8
+    max_param_proposals: 3
+
+  # 4) Walk-forward optimizer: champion/challenger. Candidates = incumbent +
+  #    random perturbations + analyst proposals, each backtested on real CSV
+  #    history, split in-sample / out-of-sample by time. Promotion requires
+  #    beating the incumbent out-of-sample with a margin AND a bootstrap
+  #    win-probability. Never runs on the synthetic feed.
+  optimizer:
+    enabled: true
+    bars: 20000
+    n_random: 12
+    is_fraction: 0.7           # older 70% in-sample, newest 30% out-of-sample
+    min_oos_trades: 20
+    margin_r: 0.03             # OOS expectancy must beat incumbent by this (in R)
+    bootstrap_prob: 0.75       # P(candidate > incumbent) over 1000 resamples
+    max_dd_ratio: 1.3          # candidate max DD may not exceed incumbent's by more
+    bounds:                    # the ONLY parameters the system may ever change
+      ema_fast: [10, 30]
+      ema_slow: [35, 80]
+      adx_min: [12, 30]
+      pullback_atr: [0.4, 1.4]
+      sl_atr_mult: [1.0, 2.5]
+      tp_r_multiple: [1.2, 3.0]
+
+  # 5) Live guard: if the promoted champion underperforms its own
+  #    out-of-sample estimate after enough live trades, auto-revert.
+  rollback:
+    min_trades: 20
+    margin_r: 0.05
+
+  schedule:
+    weekly_day: 6              # Sunday (Mon=0)
+    weekly_hour_utc: 12
+    daily_hour_utc: 22         # history caching (live mode)
+
+logging:
+  level: INFO
+  file: logs/bot.log
